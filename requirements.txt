@@ -1,0 +1,16 @@
+pymongo
+pyyaml
+python-dotenv
+requests
+fastapi
+rich
+uvicorn
+argparse
+tinydb
+python-nmap
+jira
+google-auth
+google-api-python-client
+numpy==1.24.4
+pandas 
+rich-tools
