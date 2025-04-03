@@ -39,23 +39,23 @@ To get a local copy up and running follow these simple example steps.
 
 ### Prerequisites
 - nuclei
-  ```sh
+  ```console
   go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
   ```
 - gau
-  ```sh
+  ```console
   go install github.com/lc/gau/v2/cmd/gau@latest
   ```
 - tlsx
-  ```sh
+  ```console
   go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
   ```
 - naabu
-  ```sh
+  ```console
   go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.3.3
   ```
 - ffuf
-  ```sh
+  ```console
   go install github.com/ffuf/ffuf/v2@latest
   ```
 - BuiltWithAPI
@@ -68,15 +68,15 @@ To get a local copy up and running follow these simple example steps.
 
 ### Installation
 1. Clone the repo
-   ```sh
+   ```console
    git clone https://github.com/Groww-oss/Appollo.git
    ```
 2. Install requirements
-   ```sh
+   ```console
    pip install -r requirements.txt
    ```
 3. Enter your API Keys as well as required URLs in `.env`
-   ```py
+   ```console
     CLOUDFLARE_API_KEY=<API_KEY>
     MONGO_URI=<MONGO_URI>
     MONGI_DB=<MONGO_DB>
@@ -95,7 +95,7 @@ To get a local copy up and running follow these simple example steps.
 
 ## Usage
 To use Appollo, you can run the following commands based on your requirements:
-```
+```console
 usage: appollo.py [-h] -e ENV [-t TARGET] [-U] [-sc] [-ps] [-ws]
                   [-ts] [-ds] [-ns] [-A]
 
@@ -163,7 +163,7 @@ Don't forget to give the project a star!
 Distributed under the MIT License. See [MIT License](/LICENSE) for more information.
 
 ## Contact
-Bhavye Malhotra - [@wh1t3r0se_](https://twitter.com/wh1tr0se_) - bhavyem@groww.in  
+Bhavye Malhotra - [@wh1t3r0se_](https://twitter.com/wh1t3r0se_) - bhavyem@groww.in  
 Srilakshmi Prathapan - [@L0xm1](https://twitter.com/L0xm1_07) - srilakshmip@groww.in
 
 ## Acknowledgments
