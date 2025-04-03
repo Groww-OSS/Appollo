@@ -159,7 +159,7 @@ class Appollo:
             target = []
             ssl_collection = MongoDB().set_collection("SSL Certificates")
             if self.args.complete_scan:
-                print("[bold blue][+] Running SSL checker on all domains[/bold green]")
+                print("[bold blue][+] Running SSL checker on all domains[/bold blue]")
                 dns_collection = MongoDB().set_collection("DNS")
                 cloudflare_records = dns_collection.find({'source': 'cloudflare'})
                 gcp_dns = dns_collection.find({'source': 'GCP'})
@@ -221,7 +221,7 @@ class Appollo:
                 else:
                     print(f"[bold green][+] Jira ticket already created For {domain}[/bold green]")
             else:
-                print("No data extracted.")
+                print("[bold red][-] No SSL information found[/bold red]")
 
 #************************** PORT SCAN **************************
 
@@ -239,7 +239,7 @@ class Appollo:
                         f.write("Domain,IP,Port\n")
 
             if self.args.complete_scan:
-                print("[bold green][+] Running Complete Port Scan [/bold green]")
+                print("[bold blue][+] Running Complete Port Scan [/bold blue]")
                 dns_collection = MongoDB().set_collection("IP Records")
                 ip_collection = MongoDB().set_collection("DNS")
                 cloudflare_records = dns_collection.find({'source': 'cloudflare'})
@@ -271,7 +271,7 @@ class Appollo:
                     ip = socket.gethostbyname(self.args.target)
                     ip_domain[self.args.target] = ip
                     domains.append(self.args.target)
-                    print(f"[bold green][+] Running Port scan on {self.args.target}")
+                    print(f"[bold blue][+] Running Port scan on {self.args.target}[/bold blue]")
                 except socket.gaierror:
                     print(f"[bold red][-] Unable to resolve {self.args.target}[/bold red]")
                     return
@@ -289,7 +289,7 @@ class Appollo:
                         ip = ip_domain.get(domain, '')
                         results[domain] = {'ip': ip, 'ports': result or []}
                     except Exception as e:
-                        print(f"[bold red][-] Error scanning {domain}: {e}")
+                        print(f"[bold red][-] Error scanning {domain}: {e}[/bold red]")
 
             previous_results = system.read_from_csv(previous_csv_file_path)
             delta_ports = system.get_delta_ports(results, previous_results)
@@ -319,11 +319,11 @@ class Appollo:
                         )
                         print(f"[bold green][+] Jira ticket created successfully for {domain} with open ports[/bold green]")
                     else:
-                        print(f"[bold yellow][+] Jira ticket already exists for {domain}")
+                        print(f"[bold yellow][+] Jira ticket already exists for {domain}[/bold yellow]")
 
                 system.send_slack_alert(f"Port scan completed successfully at {datetime.now()}")
             else:
-                print("[bold yellow][+] No new open ports found.")
+                print("[bold red][-] No new open ports found.[/bold red]")
 
 #********************* WAYBACK SCAN ************************
         if self.args.wayback_scan:
@@ -509,23 +509,22 @@ class Appollo:
                 for records in cloudflare_records:
                     for record in records.get('records', []):
                         for r in record.get('records', []):
-                            if r.get('type') == 'A':
-                                if r.get('content')[:3] != '10.' and r.get('content')[:8] != '192.168' and r.get('content')[:4] != '127.':
-                                    targets.append(r.get('name'))
+                            if r.get('type') == 'A' and not r.get('content').startswith(('10.', '192.168', '127.')):
+                                targets.append(r.get('name'))
                         targets.append(record.get('domain'))
 
                 for records in gcp_records:
                     for record in records.get('records', []):
-                        if record.get('TYPE') == 'A':
-                            if record.get('RRDATA')[0][:3] != '10.' and record.get('RRDATA')[0][:8] != '192.168' and record.get('RRDATA')[0][:4] != '127.':
-                                targets.append(record.get('NAME'))
-
+                        if record.get('TYPE') == 'A' and not record.get('RRDATA')[0].startswith(('10.', '192.168', '127.')):
+                            targets.append(record.get('NAME'))
             else:
                 if self.args.target:
                     targets.append(self.args.target)
                 else:
                     print("[bold red][-] No target provided[/bold red]")
                     return
+
+        is_alert_sent = False
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             tasks = []
@@ -550,7 +549,7 @@ class Appollo:
                     for endpoint, status_code in result.items():
                         table.add_row(target, endpoint, str(status_code))
 
-                        if(endpoint):
+                        if endpoint:
                             query = {"domain": target, "endpoint": endpoint}
                             update = {"$set": {"domain": target, "endpoint": endpoint, "status code": str(status_code)}}
                             dir_collection.update_one(query, update, upsert=True)
@@ -561,26 +560,32 @@ class Appollo:
                                 'Status code': [str(status_code)]
                             })
 
-                        hash_value = system.calculate_hash(row.values.tolist())
-                        is_alert_sent = system.check_if_hash_exists(hash_value)
-                        if not system.check_if_hash_exists(hash_value):
-                            system.add_hash_to_db(hash_value)
+                            hash_value = system.calculate_hash(row.values.tolist())
+                            if not system.check_if_hash_exists(hash_value):
+                                system.add_hash_to_db(hash_value)
+                                is_alert_sent = True
+                                table_content += f"| {target} | {endpoint} | {status_code} |\n"
 
-                        table_content += f"| {target} | {endpoint} | {status_code} |\n"
-                    if(not is_alert_sent):
-                        system.send_slack_alert(f"Exposed Endpoints Found for {target}")
-                        jira_issue = system.create_jira_issue(
-                            self.jira,
-                            'APOC',
-                            f'[Exposed Endpoints] {target} has exposed directories',
-                            table_content,
-                            issue_type="Bug",
-                            label=self.label
-                        )
-                        print(f"[bold blue][+] JIRA ticket created successfully for {target} with exposed endpoints")
-                    else:
-                        print(f"[bold red][+] No new exposed endpoints found for {target}[/bold red]")
-                print(table)
+                else:
+                    print(f"[bold red][-] No exposed endpoints found for {target} [/bold red]")
+                    table.add_row(target, "N/A", "N/A")
+
+            if is_alert_sent:
+                jira_issue = system.create_jira_issue(
+                    self.jira,
+                    'APOC',
+                    f'[Exposed Endpoints] {target} has exposed directories',
+                    table_content,
+                    issue_type="Bug",
+                    label=self.label
+                )
+                print(f"[bold blue][+] JIRA ticket created successfully for {target} with exposed endpoints")
+                system.send_slack_alert(f"Exposed Endpoints Found for {target}. Visit JIRA {jira_issue.key}")
+            else:
+                print(f"[bold red][-] Jira ticket already exists for {target} with exposed endpoints[/bold red]")
+
+        print(table)
+
 
 #*********************** NUCLEI SCAN ************************  
         if self.args.nuclei_scan:

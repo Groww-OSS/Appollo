@@ -109,7 +109,9 @@ options:
 ```
 
 ## Video POC
-<video src="/src/poc/appollo-poc.mp4" style="width: 100%; height: auto;"  controls></video>
+<video style="width: 100%; height: auto;" controls>
+  <source src="/src/poc/Appollo-Poc.mp4" type="video/mp4">
+</video>
 
 ## Appsmith Dashboard
 Follow these steps to set up your Appsmith dashboard using the provided .json file.
