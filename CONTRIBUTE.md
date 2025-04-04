@@ -10,15 +10,15 @@ Don't forget to **give the project a star** if you find it helpful!
 
 1. **Fork the Project**
 2. **Create your Feature Branch**
-   ```bash
+   ```console
    git checkout -b feature/Feature
    ```
 3. **Commit your Changes**
-   ```bash
+   ```console
    git commit -m 'Add some Feature'
    ```
 4. **Push to the Branch**
-   ```bash
+   ```console
    git push origin feature/Feature
    ```
 5. **Open a Pull Request**
