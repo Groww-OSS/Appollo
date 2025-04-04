@@ -6,9 +6,9 @@
 <h1 align="center">Appollo - C.A.S.T. solution</h1>
 <p align="center">Think you're secure? Appollo will make sure.
 <br/>
-<a href="/src/poc/Appollo-Poc.mp4">View Demo</a>  
-<a href="mailto:security@groww.in">Report Bug</a>
-<a href="./CONTRIBUTE.md">Request Feature</a>
+ <a href="/src/poc/Appollo-Poc.mp4">View Demo</a>  
+ <a href="mailto:security@groww.in">Report Bug</a>
+ <a href="./CONTRIBUTE.md">Request Feature</a>
 </p>
 </div>
 
