@@ -7,6 +7,7 @@ from jira import JIRA
 def get_jira_client():
     options = {
         'server': os.environ.get("JIRA_SERVER"),
+        'verify': False  # Disable SSL verification
     }
     return JIRA(options, basic_auth=(os.environ.get("JIRA_USER"), os.environ.get("JIRA_API_TOKEN")))
 
