@@ -1,78 +1,46 @@
-"""
-Dangling DNS Detection Module
-=============================
-
-This module detects dangling DNS records by comparing Cloudflare DNS records
-against public IPs from Google Cloud Platform (GCP) projects. A "dangling" DNS
-record points to an IP address that is no longer associated with any active
-GCP resource, which can pose security risks (subdomain takeover vulnerabilities).
-
-Features:
----------
-- Fetches all DNS zones from Cloudflare automatically (or specific zones)
-- Collects public IPs from all GCP projects (VMs, Load Balancers, Static IPs)
-- Identifies DNS A/AAAA records pointing to IPs not found in GCP
-- Supports IP whitelisting to exclude known external IPs
-- Deduplication via hash-based tracking to avoid repeated alerts
-
-Required Environment Variables:
--------------------------------
-    CLOUDFLARE_API_KEY : str
-        Cloudflare API token with Zone:Read and DNS:Read permissions.
-        Create at: https://dash.cloudflare.com/profile/api-tokens
-    
-    SVC_ACCOUNT : str
-        Path to GCP service account JSON key file.
-        Required IAM roles: compute.viewer, resourcemanager.projectViewer
-        Default: ./credentials/gcp-service-account.json
-
-Optional Environment Variables:
--------------------------------
-    WHITELIST_FILE : str
-        Path to a file containing IPs/CIDRs to exclude from dangling detection.
-        One entry per line, supports # comments.
-        Default: ./config/whitelist.txt
-    
-    MAX_WORKERS : int
-        Maximum parallel workers for GCP API calls.
-        Default: 200
-
-Usage:
-------
-    from modules.dangling_dns import get_dangling_dns_dict
-    
-    # Check all Cloudflare zones accessible by API token
-    results = get_dangling_dns_dict()
-    
-    # Check specific zones only
-    results = get_dangling_dns_dict(zone_names=['example.com', 'mysite.org'])
-    
-    # Force re-scan even if data hasn't changed
-    results = get_dangling_dns_dict(force_update=True)
-
-Author: Appollo Security
-License: MIT
-"""
-
+import ast
 import ipaddress
-import requests
-import google.auth
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
+import warnings
+
 import concurrent.futures
 import os
 import pandas as pd
+import requests
+import urllib3
+import google.auth
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.console import Console
+from rich import print
+from urllib3.exceptions import InsecureRequestWarning
+
 from system.db import MongoDB
-from system.utils import calculate_hash, check_if_hash_exists, add_hash_to_db
+from system.utils import (
+    calculate_hash, check_if_hash_exists, add_hash_to_db,
+    clear_hash_database, get_hash_database_info,
+)
 
-console = Console()
+MAX_WORKERS = 200
 
-# Configuration via environment variables with sensible defaults
-MAX_WORKERS = int(os.getenv('MAX_WORKERS', '200'))
-WHITELIST_FILE = os.getenv('WHITELIST_FILE', '/etc/config/whitelist.txt')
-SVC_ACCOUNT = os.getenv('SVC_ACCOUNT', '/etc/config/creds.json')
+WHITELIST_FILE = os.getenv('WHITELIST_FILE', '/app/config/whitelist.txt')
+
+
+def _get_cf_verify():
+    """Determine SSL verify setting for Cloudflare API calls.
+
+    Reuses the same env vars as the Cloudflare module:
+      CLOUDFLARE_CA_BUNDLE  - path to a custom CA PEM bundle
+      CLOUDFLARE_VERIFY     - 'false' to disable verification (testing only)
+    """
+    ca = os.environ.get("CLOUDFLARE_CA_BUNDLE")
+    if ca:
+        return ca
+    verify_env = os.environ.get("CLOUDFLARE_VERIFY", "")
+    if verify_env.lower() in ("false", "0", "no"):
+        urllib3.disable_warnings(InsecureRequestWarning)
+        return False
+    return True
 
 def load_whitelist():
     whitelist = set()
@@ -83,14 +51,13 @@ def load_whitelist():
                 if line and not line.startswith('#'):
                     whitelist.add(line)
     else:
-        console.print(f"[bold yellow][-] Whitelist file not found at {WHITELIST_FILE}, using empty whitelist[/bold yellow]")
+        print(f"[bold yellow][!] Whitelist file not found at {WHITELIST_FILE}, using empty whitelist[/bold yellow]")
     return whitelist
 
 def preprocess_whitelist(whitelist):
     ip_set = set()
     cidr_list = []
     
-    # Process entries in parallel for better performance
     def process_entry(entry):
         if '/' in entry:
             try:
@@ -100,7 +67,6 @@ def preprocess_whitelist(whitelist):
         else:
             return ('ip', entry)
     
-    # Use list comprehension for faster processing
     processed_entries = [process_entry(entry) for entry in whitelist]
     
     for result in processed_entries:
@@ -140,24 +106,9 @@ def get_cloudflare_zone_id(headers, zone_name):
     """Get Cloudflare zone ID for a given zone name"""
     url = "https://api.cloudflare.com/client/v4/zones"
     params = {'name': zone_name}
-    res = requests.get(url, headers=headers, params=params)
+    res = requests.get(url, headers=headers, params=params, verify=_get_cf_verify(), timeout=60)
     res.raise_for_status()
     return res.json()['result'][0]['id']
-
-def get_all_cloudflare_zones(headers):
-    """Get all Cloudflare zones accessible by the API token"""
-    url = "https://api.cloudflare.com/client/v4/zones"
-    zones = []
-    page = 1
-    while True:
-        res = requests.get(url, headers=headers, params={"page": page, "per_page": 50})
-        res.raise_for_status()
-        data = res.json()
-        zones.extend(data['result'])
-        if page >= data['result_info']['total_pages']:
-            break
-        page += 1
-    return zones
 
 def get_dns_records(headers, zone_id):
     """Get all DNS records from Cloudflare for a zone"""
@@ -165,7 +116,7 @@ def get_dns_records(headers, zone_id):
     records = []
     page = 1
     while True:
-        res = requests.get(url, headers=headers, params={"page": page, "per_page": 100})
+        res = requests.get(url, headers=headers, params={"page": page, "per_page": 100}, verify=_get_cf_verify(), timeout=60)
         res.raise_for_status()
         data = res.json()['result']
         if not data:
@@ -192,20 +143,27 @@ def get_project_ips(credentials, project_id):
     """Get all public IPs for a GCP project (VMs, load balancers, static IPs)"""
     compute = build('compute', 'v1', credentials=credentials)
     ips = set()
+    console = Console()
 
     # Static IPs
+    console.print(f"[dim]      📍 Fetching static IPs for {project_id}...[/dim]")
     req = compute.addresses().aggregatedList(project=project_id)
+    static_count = 0
     while req is not None:
         res = req.execute()
         for _, scope in res.get('items', {}).items():
             for addr in scope.get('addresses', []):
                 if 'address' in addr:
                     ips.add(addr['address'])
+                    static_count += 1
         req = compute.addresses().aggregatedList_next(previous_request=req, previous_response=res)
+    console.print(f"[dim]      ✓ Found {static_count} static IPs[/dim]")
 
     # VM Instance IPs
+    console.print(f"[dim]      🖥️  Fetching VM instance IPs for {project_id}...[/dim]")
     zones_req = compute.zones().list(project=project_id)
     zones = zones_req.execute().get('items', [])
+    vm_count = 0
     for zone in zones:
         zone_name = zone['name']
         try:
@@ -215,18 +173,24 @@ def get_project_ips(credentials, project_id):
                     for ac in iface.get('accessConfigs', []):
                         if 'natIP' in ac:
                             ips.add(ac['natIP'])
+                            vm_count += 1
         except Exception:
             continue  # skip zones with no instances
+    console.print(f"[dim]      ✓ Found {vm_count} VM instance IPs[/dim]")
 
     # Load Balancer IPs (Forwarding Rules)
+    console.print(f"[dim]      ⚖️  Fetching load balancer IPs for {project_id}...[/dim]")
     fr_req = compute.forwardingRules().aggregatedList(project=project_id)
+    lb_count = 0
     while fr_req is not None:
         fr_res = fr_req.execute()
         for _, scope in fr_res.get('items', {}).items():
             for fr in scope.get('forwardingRules', []):
                 if 'IPAddress' in fr:
                     ips.add(fr['IPAddress'])
+                    lb_count += 1
         fr_req = compute.forwardingRules().aggregatedList_next(previous_request=fr_req, previous_response=fr_res)
+    console.print(f"[dim]      ✓ Found {lb_count} load balancer IPs[/dim]")
 
     return ips
 
@@ -239,12 +203,14 @@ def is_public_ip(ip):
 
 def get_all_gcp_ips(credentials, max_workers=300):
     """Get all public IPs from all GCP projects"""
-    console.print("[bold blue] Listing GCP projects...[/bold blue]")
+    console = Console()
+    
+    console.print("[bold blue]🔍 Listing GCP projects...[/bold blue]")
     projects = list_gcp_projects(credentials)
     console.print(f"[green]✓ Found {len(projects)} eligible GCP projects[/green]")
     
     if not projects:
-        console.print("[yellow]  No GCP projects found[/yellow]")
+        console.print("[yellow]⚠️  No GCP projects found[/yellow]")
         return {}
     
     all_project_ips = {}
@@ -253,20 +219,22 @@ def get_all_gcp_ips(credentials, max_workers=300):
     def fetch_ips(project_id):
         nonlocal completed
         try:
+            console.print(f"[dim]    ↳ Fetching IPs for {project_id}...[/dim]")
             ips = get_project_ips(credentials, project_id)
             completed += 1
+            console.print(f"[green]    ✓ {project_id}: Found {len(ips)} IPs ({completed}/{len(projects)})[/green]")
             return project_id, ips
         except Exception as e:
             completed += 1
             # Extract clean message
             err_msg = str(e)
             if "accessNotConfigured" in err_msg:
-                console.print(f"[yellow]{project_id}: Compute Engine API not enabled ({completed}/{len(projects)})[/yellow]")
+                console.print(f"[yellow]    ⚠️  {project_id}: Compute Engine API not enabled ({completed}/{len(projects)})[/yellow]")
             else:
-                console.print(f"[red] {project_id}: Error fetching IPs ({completed}/{len(projects)})[/red]")
+                console.print(f"[red]    ❌ {project_id}: Error fetching IPs ({completed}/{len(projects)})[/red]")
             return project_id, set()
     
-    console.print(f"[bold blue] Collecting IPs in parallel using {max_workers} workers...[/bold blue]")
+    console.print(f"[bold blue]🚀 Collecting IPs in parallel using {max_workers} workers...[/bold blue]")
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = list(executor.map(fetch_ips, projects))
         all_project_ips = dict(futures)
@@ -281,19 +249,23 @@ def get_all_gcp_ips(credentials, max_workers=300):
 
 def debug_dns_records(zone_name=None, limit=10):
     """
-    Debug function to inspect DNS records and help troubleshoot issues.
-    If zone_name is not provided, fetches all zones from Cloudflare API.
+    Debug function to inspect DNS records and help troubleshoot issues
     """
+    console = Console()
+    
     try:
+        # Get configuration from environment
+        if not zone_name:
+            zone_name = os.getenv("ZONE_NAME", "")
+        
         cloudflare_token = os.getenv('CLOUDFLARE_API_KEY')
         if not cloudflare_token:
             console.print("[bold red]Error: CLOUDFLARE_API_KEY environment variable not set[/bold red]")
-            console.print("[dim]Create an API token at: https://dash.cloudflare.com/profile/api-tokens[/dim]")
             return False
         
-        if not os.path.exists(SVC_ACCOUNT):
-            console.print(f"[bold red]Error: GCP service account file not found: {SVC_ACCOUNT}[/bold red]")
-            console.print("[dim]Set SVC_ACCOUNT environment variable to the correct path[/dim]")
+        gcp_creds_file = os.getenv('SVC_ACCOUNT', '/etc/config/creds.json')
+        if not os.path.exists(gcp_creds_file):
+            console.print(f"[bold red]Error: GCP service account file not found: {gcp_creds_file}[/bold red]")
             return False
         
         console.print("[bold blue]=== DNS Records Debug ===[/bold blue]")
@@ -303,31 +275,17 @@ def debug_dns_records(zone_name=None, limit=10):
             "Authorization": f"Bearer {cloudflare_token}",
             "Content-Type": "application/json"
         }
-        credentials, _ = google.auth.load_credentials_from_file(SVC_ACCOUNT)
+        credentials, _ = google.auth.load_credentials_from_file(gcp_creds_file)
         
-        # Get Cloudflare DNS records - fetch all zones if not specified
-        if zone_name:
-            zones_to_check = [{'name': zone_name}]
-            console.print(f"[dim]Using specified zone: {zone_name}[/dim]")
-        else:
-            console.print("[dim]Fetching all zones from Cloudflare API...[/dim]")
-            zones_to_check = get_all_cloudflare_zones(headers)
-            console.print(f"[dim]Found {len(zones_to_check)} zones[/dim]")
-        
-        dns_records = []
-        for zone in zones_to_check:
-            zn = zone['name']
-            console.print(f"[dim]Fetching DNS records for zone: {zn}[/dim]")
-            try:
-                zone_id = get_cloudflare_zone_id(headers, zn)
-                zone_records = get_dns_records(headers, zone_id)
-                dns_records.extend(zone_records)
-                console.print(f"[dim]  → Found {len(zone_records)} records[/dim]")
-            except Exception as e:
-                console.print(f"[bold red]Zone Error for {zn}: {str(e)}[/bold red]")
-                continue
-        
-        console.print(f"[dim]Total Cloudflare DNS records: {len(dns_records)}[/dim]")
+        # Get Cloudflare DNS records
+        console.print(f"[dim]Fetching DNS records for zone: {zone_name}[/dim]")
+        try:
+            zone_id = get_cloudflare_zone_id(headers, zone_name)
+            dns_records = get_dns_records(headers, zone_id)
+            console.print(f"[dim]Total Cloudflare DNS records: {len(dns_records)}[/dim]")
+        except Exception as e:
+            console.print(f"[bold red]Zone Error: {str(e)}[/bold red]")
+            return False
         
         # Get GCP IPs
         console.print("[dim]Fetching GCP project IPs...[/dim]")
@@ -341,8 +299,7 @@ def debug_dns_records(zone_name=None, limit=10):
         
         # Show sample DNS records
         if dns_records:
-            zone_label = zone_name if zone_name else f"{len(zones_to_check)} zones"
-            console.print(f"\n[bold]Sample DNS records from {zone_label}:[/bold]")
+            console.print(f"\n[bold]Sample DNS records from {zone_name}:[/bold]")
             for i, record in enumerate(dns_records[:limit]):
                 if record['type'] in ['A', 'AAAA']:
                     console.print(f"  {record['name']} ({record['type']}) -> {record['content']}")
@@ -381,16 +338,21 @@ def check_existing_results_hash(dns_data):
         else:
             return False, data_hash
     except Exception as e:
-        console.print(f"[bold red]Error checking hash: {str(e)}[/bold red]")
+        print(f"[bold red]Error checking hash: {str(e)}[/bold red]")
         return False, None
 
 def find_dangling_records(dns_records, all_project_ips_map, whitelist_ips=None):
     """Find DNS records that point to IPs not found in any GCP project"""
+    console = Console()
     dangling = []
     all_ips = set()
+    
+    console.print("[dim]   📊 Building IP lookup set...[/dim]")
     for ips in all_project_ips_map.values():
         all_ips.update(ip for ip in ips if is_public_ip(ip))
+    console.print(f"[dim]   ✓ Built lookup set with {len(all_ips)} public IPs[/dim]")
 
+    console.print("[dim]   🔍 Analyzing DNS records...[/dim]")
     processed = 0
     skipped_private = 0
     skipped_whitelist = 0
@@ -398,6 +360,8 @@ def find_dangling_records(dns_records, all_project_ips_map, whitelist_ips=None):
     
     for rec in dns_records:
         processed += 1
+        if processed % 100 == 0:
+            console.print(f"[dim]   📈 Processed {processed}/{len(dns_records)} DNS records...[/dim]")
             
         if rec['type'] not in ['A', 'AAAA']:
             skipped_type += 1
@@ -431,65 +395,84 @@ def find_dangling_records(dns_records, all_project_ips_map, whitelist_ips=None):
     
     return dangling
 
-def get_dangling_dns_dict(domains=None, force_update=False, max_workers=300, zone_names=None):
+def get_dangling_dns_dict(domains=None, force_update=False, max_workers=300):
     """
     Find dangling DNS records by comparing Cloudflare DNS records with all GCP project IPs.
     Always uses direct API calls for the most accurate and up-to-date results.
     
     Args:
-        domains: List of domains to check (for backward compatibility, not used in new logic)
+        domains: List of domains to check (optional, if None, fetches all zones from Cloudflare)
         force_update: Force update even if data was recently processed
         max_workers: Maximum number of parallel workers for GCP API calls
-        zone_names: Optional list of specific zone names to check. If None, fetches all zones from API.
     
     Returns:
         Dictionary of dangling DNS records
     """
+    console = Console()
+    
     # Startup banner
-    console.print("\n[bold blue] Starting Dangling DNS Detection Scan[/bold blue]")
+    console.print("\n[bold blue]🚀 Starting Dangling DNS Detection Scan[/bold blue]")
     console.print("[dim]=" * 50 + "[/dim]")
     
-    console.print(f"[bold]Max Workers:[/bold] {max_workers}")
-    console.print(f"[bold]Force Update:[/bold] {force_update}")
-    if zone_names:
-        console.print(f"[bold]Target Zones:[/bold] {', '.join(zone_names)}")
-    else:
-        console.print("[bold]Target Zones:[/bold] All zones (fetched from Cloudflare API)")
-    if domains:
-        console.print(f"[bold]Domains Parameter:[/bold] {len(domains)} domains (legacy parameter, not used)")
-    console.print("[dim]=" * 50 + "[/dim]\n")
-    
-    # Always use direct API approach for the most accurate results
-    console.print("[bold green]✓ Using direct API approach for real-time data[/bold green]")
-    return get_dangling_dns_from_apis(zone_names, force_update, max_workers)
-
-def get_dangling_dns_from_apis(zone_names, force_update, max_workers):
-    """Get dangling DNS records using direct Cloudflare and GCP API calls.
-    
-    Args:
-        zone_names: Optional list of zone names to check. If None, fetches all zones from API.
-        force_update: Force update even if data was recently processed
-        max_workers: Maximum number of parallel workers for GCP API calls
-    """
     cloudflare_token = os.getenv('CLOUDFLARE_API_KEY')
     if not cloudflare_token:
-        console.print("[bold red] Error: CLOUDFLARE_API_KEY environment variable not set[/bold red]")
-        console.print("[dim]Create an API token at: https://dash.cloudflare.com/profile/api-tokens[/dim]")
+        console.print("[bold red]❌ Error: CLOUDFLARE_API_KEY environment variable not set[/bold red]")
         return {}
     
-    if not os.path.exists(SVC_ACCOUNT):
-        console.print(f"[bold red] Error: GCP service account file not found: {SVC_ACCOUNT}[/bold red]")
-        console.print("[dim]Set SVC_ACCOUNT environment variable to the correct path[/dim]")
+    headers = {
+        "Authorization": f"Bearer {cloudflare_token}",
+        "Content-Type": "application/json"
+    }
+
+    # If no domains provided, fetch all zones from Cloudflare
+    if not domains:
+        console.print("[bold blue]🌐 Fetching all zones from Cloudflare...[/bold blue]")
+        try:
+            zones_url = "https://api.cloudflare.com/client/v4/zones"
+            response = requests.get(zones_url, headers=headers, verify=_get_cf_verify(), timeout=60)
+            if response.status_code == 200:
+                zones_data = response.json().get('result', [])
+                domains = [z['name'] for z in zones_data]
+                console.print(f"[green]✓ Found {len(domains)} zones in Cloudflare[/green]")
+            else:
+                console.print(f"[bold red]❌ Error fetching zones: HTTP {response.status_code}[/bold red]")
+                return {}
+        except Exception as e:
+            console.print(f"[bold red]❌ Exception fetching zones: {e}[/bold red]")
+            return {}
+
+    all_dangling = {}
+    
+    for zone_name in domains:
+        console.print(f"\n[bold cyan]🔍 Scanning Zone:[/bold cyan] [bold white]{zone_name}[/bold white]")
+        zone_dangling = get_dangling_dns_from_apis(zone_name, force_update, max_workers)
+        if zone_dangling:
+            all_dangling.update(zone_dangling)
+            
+    return all_dangling
+
+def get_dangling_dns_from_apis(zone_name, force_update, max_workers):
+    """Get dangling DNS records using direct Cloudflare and GCP API calls"""
+    console = Console()
+    
+    cloudflare_token = os.getenv('CLOUDFLARE_API_KEY')
+    if not cloudflare_token:
+        console.print("[bold red]❌ Error: CLOUDFLARE_API_KEY environment variable not set[/bold red]")
+        return {}
+    
+    gcp_creds_file = os.getenv('SVC_ACCOUNT', '/etc/config/creds.json')
+    if not os.path.exists(gcp_creds_file):
+        console.print(f"[bold red]❌ Error: GCP service account file not found: {gcp_creds_file}[/bold red]")
         return {}
     
     # Load whitelist
-    console.print("[bold blue] Loading whitelist...[/bold blue]")
+    console.print("[bold blue]📋 Loading whitelist...[/bold blue]")
     whitelist = load_whitelist()
     ip_set, cidr_list = preprocess_whitelist(whitelist)
     console.print(f"[green]✓ Loaded {len(whitelist)} whitelist entries[/green]")
     
     # Setup headers
-    console.print("[bold blue] Setting up Cloudflare connection...[/bold blue]")
+    console.print("[bold blue]🔧 Setting up Cloudflare connection...[/bold blue]")
     headers = {
         "Authorization": f"Bearer {cloudflare_token}",
         "Content-Type": "application/json"
@@ -497,50 +480,26 @@ def get_dangling_dns_from_apis(zone_names, force_update, max_workers):
     console.print("[green]✓ Cloudflare headers configured[/green]")
     
     # Setup GCP credentials
-    console.print("[bold blue] Setting up GCP connection...[/bold blue]")
+    console.print("[bold blue]🔧 Setting up GCP connection...[/bold blue]")
     try:
-        credentials, _ = google.auth.load_credentials_from_file(SVC_ACCOUNT)
-        console.print("[green] GCP credentials loaded successfully[/green]")
+        credentials, _ = google.auth.load_credentials_from_file(gcp_creds_file)
+        console.print("[green]✓ GCP credentials loaded successfully[/green]")
     except Exception as e:
-        console.print(f"[bold red] Error setting up GCP: {str(e)}[/bold red]")
+        console.print(f"[bold red]❌ Error setting up GCP: {str(e)}[/bold red]")
         return {}
     
-    # Determine which zones to check
-    console.print("[bold blue] Fetching Cloudflare zones...[/bold blue]")
+    console.print(f"[bold blue]🌐 Fetching Cloudflare zone ID for {zone_name}...[/bold blue]")
     try:
-        if zone_names:
-            # Use provided zone names
-            zones_to_check = [{'name': zn} for zn in zone_names]
-            console.print(f"[green]✓ Using {len(zones_to_check)} specified zone(s)[/green]")
-        else:
-            # Fetch all zones from Cloudflare API
-            zones_to_check = get_all_cloudflare_zones(headers)
-            console.print(f"[green]✓ Found {len(zones_to_check)} zones from Cloudflare API[/green]")
-        
-        for zone in zones_to_check:
-            # Zone names are available in logs if needed, avoid verbose per-zone printing
-            _ = zone['name']
+        zone_id = get_cloudflare_zone_id(headers, zone_name)
+        console.print(f"[green]✓ Zone ID retrieved: {zone_id[:8]}...[/green]")
     except Exception as e:
-        console.print(f"[bold red] Error fetching zones: {str(e)}[/bold red]")
+        console.print(f"[bold red]❌ Error fetching zone ID: {str(e)}[/bold red]")
         return {}
     
-    # Fetch DNS records from all zones
-    console.print("[bold blue] Fetching DNS records from Cloudflare...[/bold blue]")
-    dns_records = []
-    zone_names_processed = []
+    console.print("[bold blue]📋 Fetching DNS records from Cloudflare...[/bold blue]")
     try:
-        for zone in zones_to_check:
-            zone_name = zone['name']
-            try:
-                zone_id = get_cloudflare_zone_id(headers, zone_name)
-                zone_records = get_dns_records(headers, zone_id)
-                dns_records.extend(zone_records)
-                zone_names_processed.append(zone_name)
-            except Exception as e:
-                console.print(f"[yellow] {zone_name}: {str(e)}[/yellow]")
-                continue
-        
-        console.print(f"[green]✓ Found {len(dns_records)} total DNS records from {len(zone_names_processed)} zone(s)[/green]")
+        dns_records = get_dns_records(headers, zone_id)
+        console.print(f"[green]✓ Found {len(dns_records)} DNS records from Cloudflare[/green]")
         
         # Show breakdown by type
         a_records = [r for r in dns_records if r['type'] == 'A']
@@ -548,19 +507,19 @@ def get_dangling_dns_from_apis(zone_names, force_update, max_workers):
         console.print(f"[dim]   - A records: {len(a_records)}[/dim]")
         console.print(f"[dim]   - AAAA records: {len(aaaa_records)}[/dim]")
     except Exception as e:
-        console.print(f"[bold red] Error fetching DNS records: {str(e)}[/bold red]")
+        console.print(f"[bold red]❌ Error fetching DNS records: {str(e)}[/bold red]")
         return {}
     
-    console.print("[bold blue] Fetching GCP project IPs...[/bold blue]")
+    console.print("[bold blue]☁️  Fetching GCP project IPs...[/bold blue]")
     try:
         all_project_ips = get_all_gcp_ips(credentials, max_workers)
-        console.print(f"[green] Completed GCP IP collection[/green]")
+        console.print(f"[green]✓ Completed GCP IP collection[/green]")
     except Exception as e:
-        console.print(f"[bold red] Error fetching GCP IPs: {str(e)}[/bold red]")
+        console.print(f"[bold red]❌ Error fetching GCP IPs: {str(e)}[/bold red]")
         return {}
     
     # Check for hash deduplication
-    console.print("[bold blue] Processing collected data...[/bold blue]")
+    console.print("[bold blue]🔍 Processing collected data...[/bold blue]")
     all_ips = set()
     for ips in all_project_ips.values():
         all_ips.update(ip for ip in ips if is_public_ip(ip))
@@ -569,16 +528,16 @@ def get_dangling_dns_from_apis(zone_names, force_update, max_workers):
     console.print(f"[dim]   - Whitelist entries: {len(whitelist)}[/dim]")
     
     dns_data = {
-        'zone_names': sorted(zone_names_processed),
+        'zone_name': zone_name,
         'dns_records': sorted([(r['name'], r['type'], r['content']) for r in dns_records]),
         'gcp_ips': sorted(list(all_ips)),
         'whitelist': sorted(list(whitelist))
     }
     
-    console.print("[bold blue] Checking for duplicate data...[/bold blue]")
+    console.print("[bold blue]🔐 Checking for duplicate data...[/bold blue]")
     is_processed, data_hash = check_existing_results_hash(dns_data)
     if is_processed and not force_update:
-        console.print("[bold yellow] DNS data already processed. No new changes detected.[/bold yellow]")
+        console.print("[bold yellow]⚠️  DNS data already processed. No new changes detected.[/bold yellow]")
         return {}
     
     if not is_processed:
@@ -586,16 +545,16 @@ def get_dangling_dns_from_apis(zone_names, force_update, max_workers):
     else:
         console.print(f"[green]✓ Force update enabled, reprocessing data[/green]")
     
-    console.print("[bold blue] Analyzing for dangling DNS records...[/bold blue]")
+    console.print("[bold blue]🔍 Analyzing for dangling DNS records...[/bold blue]")
     try:
         dangling_records = find_dangling_records(dns_records, all_project_ips, (ip_set, cidr_list))
         console.print(f"[green]✓ Analysis complete! Found {len(dangling_records)} potential dangling records[/green]")
     except Exception as e:
-        console.print(f"[bold red] Error analyzing dangling records: {str(e)}[/bold red]")
+        console.print(f"[bold red]❌ Error analyzing dangling records: {str(e)}[/bold red]")
         return {}
     
     # Convert to result format
-    console.print("[bold blue] Converting results to standard format...[/bold blue]")
+    console.print("[bold blue]📊 Converting results to standard format...[/bold blue]")
     result = {}
     for record in dangling_records:
         result[record['name']] = {
@@ -604,23 +563,23 @@ def get_dangling_dns_from_apis(zone_names, force_update, max_workers):
             'status': 'dangling',
             'type': record['type']
         }
-    console.print(f"[green] Converted {len(result)} records to result format[/green]")
+    console.print(f"[green]✓ Converted {len(result)} records to result format[/green]")
     
     # Store the hash to mark this data as processed
     if data_hash and not is_processed:
-        console.print("[bold blue] Storing hash for future deduplication...[/bold blue]")
+        console.print("[bold blue]💾 Storing hash for future deduplication...[/bold blue]")
         try:
             add_hash_to_db(data_hash)
-            console.print(f"[green] Stored hash {data_hash[:8]}... for future deduplication[/green]")
+            console.print(f"[green]✓ Stored hash {data_hash[:8]}... for future deduplication[/green]")
         except Exception as e:
-            console.print(f"[bold red] Warning: Failed to store hash: {str(e)}[/bold red]")
+            console.print(f"[bold red]⚠️  Warning: Failed to store hash: {str(e)}[/bold red]")
     
     # Final summary
-    console.print(f"\n[bold green] SCAN COMPLETE! Found {len(result)} dangling DNS entries[/bold green]")
+    console.print(f"\n[bold green]🎉 SCAN COMPLETE! Found {len(result)} dangling DNS entries[/bold green]")
     if result:
-        console.print("[bold yellow] Dangling DNS records detected - review required![/bold yellow]")
+        console.print("[bold yellow]⚠️  Dangling DNS records detected - review required![/bold yellow]")
     else:
-        console.print("[bold green] No dangling DNS records found - all good![/bold green]")
+        console.print("[bold green]✅ No dangling DNS records found - all good![/bold green]")
     
     return result
 
@@ -628,14 +587,14 @@ def get_dangling_dns_from_mongodb(domains, force_update):
     """Get dangling DNS records using MongoDB data (legacy approach)"""
     console = Console()
     
-    console.print("[bold blue] Fetching DNS records from MongoDB...[/bold blue]")
+    console.print("[bold blue]📊 Fetching DNS records from MongoDB...[/bold blue]")
     
     try:
-        dns_collection = MongoDB().set_collection("DNS")
-        ip_collection = MongoDB().set_collection("IP Records")
+        dns_collection = MongoDB().set_collection("Prod DNS")
+        ip_collection = MongoDB().set_collection("Prod IP Records")
         
-        # Get Cloudflare DNS records
-        cloudflare_records = dns_collection.find({'source': 'cloudflare'})
+        # Get Cloudflare DNS records (match both casing variants)
+        cloudflare_records = dns_collection.find({'source': {'$in': ['Cloudflare', 'cloudflare']}})
         cf_domains = set()
         cf_domain_ips = {}  # domain -> set of IPs
         
@@ -686,9 +645,9 @@ def get_dangling_dns_from_mongodb(domains, force_update):
                     if not ip.startswith(('10.', '192.168', '127.')):
                         all_gcp_ips.add(ip)
         
-        console.print(f"[green] Found {len(cf_domains)} Cloudflare domains[/green]")
-        console.print(f"[green] Found {len(gcp_domains)} GCP domains[/green]")
-        console.print(f"[green] Found {len(all_gcp_ips)} total GCP IPs[/green]")
+        console.print(f"[green]✓ Found {len(cf_domains)} Cloudflare domains[/green]")
+        console.print(f"[green]✓ Found {len(gcp_domains)} GCP domains[/green]")
+        console.print(f"[green]✓ Found {len(all_gcp_ips)} total GCP IPs[/green]")
         
         # Find dangling domains - domains in Cloudflare but not in GCP
         dangling_domains = cf_domains - gcp_domains
@@ -719,7 +678,7 @@ def get_dangling_dns_from_mongodb(domains, force_update):
         return result
         
     except Exception as e:
-        console.print(f"[bold red] Error fetching from MongoDB: {str(e)}[/bold red]")
+        console.print(f"[bold red]❌ Error fetching from MongoDB: {str(e)}[/bold red]")
         return {}
 
 def get_dangling_dns_dict_legacy(domains=None, force_update=False):
@@ -807,15 +766,16 @@ def get_new_dangling_dns_only(domains=None, force_update=False, csv_file_path=No
             if not df.empty and 'cloudflare_ips' in df.columns and 'gcp_ips' in df.columns:
                 for _, row in df.iterrows():
                     domain = row['Domain']
-                    cf_ips = eval(row['cloudflare_ips']) if pd.notna(row['cloudflare_ips']) else []
-                    gcp_ips = eval(row['gcp_ips']) if pd.notna(row['gcp_ips']) else []
+                    # Use safe literal_eval instead of eval()
+                    cf_ips = ast.literal_eval(row['cloudflare_ips']) if pd.notna(row['cloudflare_ips']) else []
+                    gcp_ips = ast.literal_eval(row['gcp_ips']) if pd.notna(row['gcp_ips']) else []
                     previous_results[domain] = {
                         'cloudflare_ips': cf_ips,
                         'gcp_ips': gcp_ips,
                         'status': row.get('status', 'unknown')
                     }
         except Exception as e:
-            console.print(f"[bold red] Warning: Could not read previous results from {csv_file_path}: {str(e)}[/bold red]")
+            console.print(f"[bold red]Warning: Could not read previous results from {csv_file_path}: {str(e)}[/bold red]")
     
     # Find new results only
     new_results = {}
@@ -832,9 +792,9 @@ def get_new_dangling_dns_only(domains=None, force_update=False, csv_file_path=No
                 new_results[domain] = current_data
     
     if new_results:
-        console.print(f"[bold green] Found {len(new_results)} new/changed dangling DNS entries[/bold green]")
+        console.print(f"[bold green]Found {len(new_results)} new/changed dangling DNS entries[/bold green]")
     else:
-        console.print("[bold yellow] No new dangling DNS entries found[/bold yellow]")
+        console.print("[bold yellow]No new dangling DNS entries found[/bold yellow]")
     
     return new_results
 
@@ -855,14 +815,14 @@ def test_dangling_dns_logic():
         {'name': 'test4.example.com', 'type': 'A', 'content': '8.8.8.8'},  # Public IP not in GCP
     ]
     
-    sample_gcp_ips = {'1.2.3.4', '5.6.7.8', '9.10.11.12'}  # Only first IP exists in GCP
+    sample_gcp_ips = {"test-project": {'1.2.3.4', '5.6.7.8', '9.10.11.12'}}  # Only first IP exists in GCP
     
     # Test the logic
-    dangling = find_dangling_records(sample_dns_records, sample_gcp_ips)
+    dangling = find_dangling_records(sample_dns_records, sample_gcp_ips, whitelist_ips=None)
     
-    console.print(f"[dim] Sample DNS records: {len(sample_dns_records)}[/dim]")
-    console.print(f"[dim] Sample GCP IPs: {len(sample_gcp_ips)}[/dim]")
-    console.print(f"[dim] Found dangling records: {len(dangling)}[/dim]")
+    console.print(f"[dim]Sample DNS records: {len(sample_dns_records)}[/dim]")
+    console.print(f"[dim]Sample GCP IPs: {len(sample_gcp_ips)}[/dim]")
+    console.print(f"[dim]Found dangling records: {len(dangling)}[/dim]")
     
     for record in dangling:
         console.print(f"  - {record['name']} ({record['type']}) -> {record['target']}")
@@ -870,10 +830,10 @@ def test_dangling_dns_logic():
     # Expected: test4.example.com should be dangling (8.8.8.8 not in GCP)
     expected_dangling = 1
     if len(dangling) == expected_dangling:
-        console.print("[bold green] Logic test passed![/bold green]")
+        console.print("[bold green]✓ Logic test passed![/bold green]")
         return True
     else:
-        console.print(f"[bold red] Logic test failed! Expected {expected_dangling} dangling records, got {len(dangling)}[/bold red]")
+        console.print(f"[bold red]✗ Logic test failed! Expected {expected_dangling} dangling records, got {len(dangling)}[/bold red]")
         return False
 
 def clear_dns_hash_database():
@@ -882,18 +842,13 @@ def clear_dns_hash_database():
     This is useful for testing or when you want to reprocess all data.
     """
     console = Console()
-    
+
     try:
-        # Import here to avoid circular imports
-        from system.utils import clear_hash_database
         clear_hash_database()
-        console.print("[bold green] DNS hash database cleared successfully[/bold green]")
+        console.print("[bold green]✓ DNS hash database cleared successfully[/bold green]")
         return True
-    except ImportError:
-        console.print("[bold red] Could not import clear_hash_database function[/bold red]")
-        return False
     except Exception as e:
-        console.print(f"[bold red] Error clearing hash database: {str(e)}[/bold red]")
+        console.print(f"[bold red]✗ Error clearing hash database: {e}[/bold red]")
         return False
 
 def get_dns_hash_status():
@@ -902,16 +857,14 @@ def get_dns_hash_status():
     Returns information about stored hashes.
     """
     console = Console()
-    
+
     try:
-        # Import here to avoid circular imports
-        from system.utils import get_hash_database_info
         info = get_hash_database_info()
         console.print(f"[dim]Hash database info: {info}[/dim]")
         return info
     except ImportError:
-        console.print("[bold red] Could not import get_hash_database_info function[/bold red]")
+        console.print("[bold red]✗ Could not import get_hash_database_info function[/bold red]")
         return None
     except Exception as e:
-        console.print(f"[bold red] Error getting hash database info: {str(e)}[/bold red]")
+        console.print(f"[bold red]✗ Error getting hash database info: {str(e)}[/bold red]")
         return None

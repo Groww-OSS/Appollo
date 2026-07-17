@@ -1,3 +1,15 @@
 .env
+.env.*
 *.csv
 *.pyc
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+kube/
+.DS_Store
+*.log
+wordlist.txt
+whitelist.txt
+gcp_firewall_scan_20260310_124647.json
+docs/AWS_MODULE_SETUP.md
