@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://github.com/Groww.png" width="72" height="72" alt="Groww" style="border-radius:50%"><br><br>
+  <img src="https://resources.groww.in/web-assets/img/website-logo/groww-logo-dark.svg" alt="Groww" width="180" height="60"><br><br>
   <h1>Appollo</h1>
   <p><strong>Continuous Attack Surface Management for modern cloud infrastructure</strong></p>
   <p>
