@@ -1,100 +1,82 @@
-# Multi-stage build for faster builds
-FROM ubuntu:20.04 AS base
+ARG AWS_CLI_VERSION=2.22.35
 
-ENV DEBIAN_FRONTEND=noninteractive
+FROM golang:1.22-bullseye AS go-build
 
-# Install all system dependencies in one layer
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpcap-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV GOPROXY=https://proxy.golang.org,direct
+ENV GOSUMDB=sum.golang.org
+ENV CGO_ENABLED=1
+
+RUN echo "Installing gau..." && \
+    timeout 600 go install -v github.com/lc/gau/v2/cmd/gau@v2.2.3
+
+RUN echo "Installing naabu..." && \
+    timeout 600 go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.3.0
+
+RUN echo "Installing nuclei..." && \
+    timeout 600 go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v3.2.9
+
+RUN echo "Installing httpx..." && \
+    timeout 600 go install -v github.com/projectdiscovery/httpx/cmd/httpx@v1.6.6
+
+RUN echo "Installing ffuf..." && \
+    timeout 600 go install -v github.com/ffuf/ffuf/v2@v2.1.0
+
+RUN echo "Installing tlsx..." && \
+    timeout 600 go install -v github.com/projectdiscovery/tlsx/cmd/tlsx@v1.1.6
+
+RUN echo "Installing subfinder..." && \
+    timeout 600 go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@v2.6.6
+
+RUN echo "Verifying Go tools..." && \
+    ls -la /go/bin/ && \
+    /go/bin/nuclei -version && \
+    echo "Go tools installation completed successfully"
+
+# AWS CLI v2 via Docker Hub (same bits as ECR public). Some CI/runner networks block or time out to public.ecr.aws.
+FROM amazon/aws-cli:${AWS_CLI_VERSION} AS awscli
+
+FROM python:3.11-slim AS final
+
+LABEL org.opencontainers.image.description="Appollo (AWS CLI from Debian; avoids blocked AWS/ECR download hosts during image build)"
+
+ENV PYTHONUNBUFFERED=1
+ENV PATH="/usr/local/go/bin:/go/bin:${PATH}"
+ENV GOPATH="/go"
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        make automake gcc g++ subversion wget git libc-dev libpcap-dev nmap curl ca-certificates \
-        build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev \
-        libreadline-dev libffi-dev libsqlite3-dev libbz2-dev gpg && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Python build stage
-FROM base AS python-build
-
-# Download and compile Python 3.9.6
-RUN wget -q https://www.python.org/ftp/python/3.9.6/Python-3.9.6.tgz && \
-    tar -xf Python-3.9.6.tgz && \
-    cd Python-3.9.6 && \
-    ./configure --enable-optimizations --prefix=/usr/local && \
-    make -j $(nproc) && \
-    make altinstall && \
-    cd .. && \
-    rm -rf Python-3.9.6 Python-3.9.6.tgz
-
-# Go build stage
-FROM base AS go-build
-
-# Install Go
-RUN wget -q https://go.dev/dl/go1.21.5.linux-amd64.tar.gz && \
-    tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz && \
-    rm go1.21.5.linux-amd64.tar.gz
-
-ENV PATH="/usr/local/go/bin:${PATH}"
-ENV GOPATH="/go"
-ENV PATH="$GOPATH/bin:/usr/local/go/bin:$PATH"
-
-# Install Go tools in parallel
-RUN go install -v github.com/lc/gau/v2/cmd/gau@latest && \
-    go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@v2.3.3 && \
-    go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@v3.1.7 && \
-    go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest && \
-    go install github.com/ffuf/ffuf/v2@latest && \
-    go install github.com/projectdiscovery/tlsx/cmd/tlsx@latest
-
-# Final stage
-FROM base AS final
-
-# Copy Python from build stage
-COPY --from=python-build /usr/local/bin/python3.9 /usr/local/bin/python3.9
-COPY --from=python-build /usr/local/bin/pip3.9 /usr/local/bin/pip3.9
-COPY --from=python-build /usr/local/lib/python3.9 /usr/local/lib/python3.9
-COPY --from=python-build /usr/local/include/python3.9 /usr/local/include/python3.9
-
-# Create symlinks for python3 and pip3
-RUN ln -sf /usr/local/bin/python3.9 /usr/local/bin/python3 && \
-    ln -sf /usr/local/bin/pip3.9 /usr/local/bin/pip3 && \
-    ln -sf /usr/local/bin/pip3.9 /usr/local/bin/pip
-
-# Copy Go tools from build stage
-COPY --from=go-build /usr/local/go /usr/local/go
-COPY --from=go-build /go/bin /go/bin
-
-ENV PATH="/usr/local/go/bin:/go/bin:${PATH}"
-
-# Install Google Cloud SDK
-RUN echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
+        make automake gcc g++ wget git libpcap-dev nmap libssl-dev \
+        curl gpg ca-certificates build-essential zlib1g-dev libffi-dev awscli && \
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list && \
     curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg && \
     apt-get update -y && \
     apt-get install -y --no-install-recommends google-cloud-sdk && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Create app directory and set working directory
+RUN python --version && pip --version
+
+COPY --from=go-build /usr/local/go /usr/local/go
+COPY --from=go-build /go/bin /go/bin
+
 WORKDIR /app
-
-# Copy requirements first for better caching
 COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip==24.2 && \
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
 COPY . /app
+RUN mkdir -p /etc/config && \
+    useradd -r -u 1001 -s /bin/false appollo && \
+    chown -R appollo /app /etc/config
 
-# Create necessary directories
-RUN mkdir -p /etc/config
+USER appollo
 
-# Verify installations
-RUN python3 --version && \
-    pip3 --version && \
-    go version && \
-    nuclei --version && \
-    ffuf -V && \
-    gcloud --version
+# CronJob AWS scans invoke `aws`; fail the image build if the binary is broken.
+RUN python3 --version && go version && nuclei --version && \
+    aws --version && command -v aws
 
 ENTRYPOINT ["python3", "src/appollo.py"]

@@ -28,19 +28,22 @@ def is_valid_ip(ip):
 
 def is_domain_accessible(domain):
     try:
-        if socket.create_connection((domain, 80), timeout=60) or socket.create_connection((domain, 443), timeout=60):
-            return True
-        else:
-            return False
-        
-    except (socket.error, socket.gaierror, socket.timeout, ConnectionRefusedError):
+        for port in [80, 443]:
+            try:
+                with socket.create_connection((domain, port), timeout=10) as s:
+                    return True
+            except (socket.error, socket.timeout):
+                continue
+        return False
+    except Exception:
         return False
 
 def is_valid_domain(domain):
     domain_regex = r"^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)+[A-Za-z]{2,6}$"
     if re.match(domain_regex, domain):
-        return is_domain_accessible(domain)
+        return True  
     return False
+    
 def determine_target_type(target):
     if is_valid_ip(target):
         return "IP"
@@ -49,42 +52,57 @@ def determine_target_type(target):
     else:
         return None
 
-def run_nuclei(target, template_path):
-    command = f'nuclei -nc -silent -j -target {target} -t {template_path}'
+def update_nuclei_templates():
     try:
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-        results = []
+        proc = subprocess.run(['nuclei', '-ut'], capture_output=True, text=True)
+        if "Successfully updated" in proc.stderr:
+            print("[bold cyan][!] New CVE templates were downloaded![/bold cyan]")
+        else:
+            print("[bold white][-] Templates already up to date.[/bold white]")
+    except Exception as e:
+        print(f"Update failed: {e}")
 
-        while True:
-            line = process.stdout.readline()
-            if line == '' and process.poll() is not None:
-                break
-            
+NUCLEI_TIMEOUT = 600
+
+
+def run_nuclei(target, template_path):
+    command = [
+        "nuclei", "-nc", "-j",
+        "-target", target,
+        "-t", template_path,
+        "-as", "-nm", "-rl", "150",
+        "-c", "25", "-retries", "2",
+        "-timeout", "5",
+        "-s", "critical,high,medium,low",
+        "-etags", "tpsa",          # exclude third-party security assessment templates
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=NUCLEI_TIMEOUT,
+        )
+
+        results = []
+        for line in proc.stdout.splitlines():
             line = line.strip()
             if not line:
-                continue   
+                continue
             try:
-                x = json.loads(line)   
-                res = [
-                    str(x.get('template-id', 'N/A')),
-                    str(x.get('matcher-status', 'N/A')),
-                    str(x['info'].get('reference', 'NOT FOUND')),
-                    str(x['info'].get('description', 'NOT FOUND')),
-                    str(x.get('request', 'N/A')),
-    ]
-                results.append(res)
+                results.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
-            except json.JSONDecodeError as e:
-                print(f"Error parsing JSON: {e} - Line: {line}")
-
-        process.communicate()
         print(f"[bold green][+] Nuclei Scan Completed For {target} ![/bold green]")
         return results
 
-    except subprocess.CalledProcessError as e:
-        print(f"Error running Nuclei: {e.output}")
-
-        
-    except subprocess.CalledProcessError as e:
-        
-        print(f"Error running Nuclei: {e.output}")
+    except subprocess.TimeoutExpired:
+        print(f"[bold red][-] Nuclei timed out for {target} after {NUCLEI_TIMEOUT}s[/bold red]")
+        return []
+    except OSError as e:
+        print(f"[bold red][-] Nuclei OS error for {target}: {e}[/bold red]")
+        return []
+    except Exception as e:
+        print(f"[bold red][-] Nuclei error for {target}: {e}[/bold red]")
+        return []

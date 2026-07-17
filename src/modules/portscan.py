@@ -9,24 +9,38 @@ Classes:
 
 Methods:
     run(host, flags): Executes the naabu command with the specified host and flags, parses the JSON output, and returns a list of open ports.
-
-Exceptions:
-    json.JSONDecodeError: Raised when there is an error decoding the JSON output from the naabu command.
-    subprocess.SubprocessError: Raised when there is an error during the execution of the naabu command.
 """
+
+NAABU_TIMEOUT = 600
+
 
 class PortScan:
 
-    def run(self, host, flags):
-        command = "naabu -host {host} {flags} -json".format(host=host, flags=flags)
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-        output, _ = process.communicate()
-        output = output.decode("utf-8").split("\n")
-        ports = []
-        for line in output:
-            if line and not line.startswith("[INF]"):
-                jsoned_line = json.loads(line)
-                if jsoned_line["port"] not in ports:
-                    ports.append(jsoned_line["port"])
+    def run(self, host: str, flags: str) -> list:
+        command = ["naabu", "-host", host] + flags.split() + ["-json"]
 
-        return ports
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            output, _ = process.communicate(timeout=NAABU_TIMEOUT)
+            lines = output.decode("utf-8").splitlines()
+            seen = set()
+            ports = []
+            for line in lines:
+                line = line.strip()
+                if line and not line.startswith("[INF]"):
+                    try:
+                        port = json.loads(line).get("port")
+                        if port and port not in seen:
+                            seen.add(port)
+                            ports.append(port)
+                    except json.JSONDecodeError:
+                        continue
+            return ports
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            print(f"[-] naabu timed out for {host} after {NAABU_TIMEOUT}s")
+            return []
+        except Exception as e:
+            print(f"[-] Error running naabu: {e}")
+            return []

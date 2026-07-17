@@ -2,9 +2,11 @@ import subprocess
 import socket
 import json
 import os
-import tempfile
 import time
 import hashlib
+import tempfile
+
+from rich import print
 """
 This module provides functionality to read JSON files, check domain accessibility, and scan endpoints using ffuf.
 Functions:
@@ -36,17 +38,36 @@ def read_json(file_path):
         return None
 
 def is_domain_accessible(domain):
-    try:
-        socket.create_connection((domain, 443), timeout=30)
-        return True
-    except (socket.error, socket.gaierror, socket.timeout, ConnectionRefusedError):
-        return False
+    """Check reachability on 443 or 80 — a plain-HTTP-only target must not be
+    marked unreachable just because it doesn't serve TLS."""
+    for port in (443, 80):
+        try:
+            socket.create_connection((domain, port), timeout=10)
+            return True
+        except (socket.error, socket.gaierror, socket.timeout, ConnectionRefusedError):
+            continue
+    return False
+
+
+def resolve_reachable_url(subdomain):
+    """Determine which scheme the target actually responds on.
+    Bare IPs from the firewall/port-scan inventory are frequently HTTP-only —
+    defaulting to https unconditionally would silently drop them from ffuf.
+    """
+    if subdomain.startswith(('http://', 'https://')):
+        return subdomain
+    for scheme, port in (("https", 443), ("http", 80)):
+        try:
+            socket.create_connection((subdomain, port), timeout=10)
+            return f"{scheme}://{subdomain}"
+        except (socket.error, socket.gaierror, socket.timeout, ConnectionRefusedError):
+            continue
+    return None
 
 def get_wordlist_path():
     """Get wordlist path with fallback and validation"""
     wordlist_path = os.getenv('DIRECTORY_WORDLIST')
     
-    # Fallback to default wordlist path if environment variable is not set
     if not wordlist_path:
         wordlist_path = "/etc/config/wordlist.txt"
         print(f"[+] Using default wordlist path: {wordlist_path}")
@@ -63,67 +84,63 @@ def check_endpoints(subdomain):
         print(f"[-] Please ensure the wordlist file exists or set DIRECTORY_WORDLIST environment variable")
         return results
     
-    url = subdomain if subdomain.startswith(('http://', 'https://')) else f"https://{subdomain}"
-    domain_accessible = is_domain_accessible(subdomain)
-    
-    if not domain_accessible:
+    url = resolve_reachable_url(subdomain)
+
+    if not url:
         print(f"[-] Domain not accessible: {subdomain}")
         return results
     
-    # Create unique temporary file for this scan
-    domain_hash = hashlib.md5(subdomain.encode()).hexdigest()[:8]
-    timestamp = int(time.time())
-    temp_file = f"/tmp/ffuf_results_{domain_hash}_{timestamp}.json"
+    domain_hash = hashlib.sha256(subdomain.encode()).hexdigest()[:8]
+    tf = tempfile.NamedTemporaryFile(
+        prefix=f"ffuf_{domain_hash}_", suffix=".json", delete=False
+    )
+    temp_file = tf.name
+    tf.close()
     
     try:
-        # Build ffuf command with better error handling
         command = [
             "ffuf",
             "-w", wordlist_path,
             "-u", f"{url}/FUZZ",
             "-o", temp_file,
-            "-s",  # Silent mode
+            "-s",  
             "-of", "json",
-            "-t", "50",  # Threads
-            "-timeout", "10",  # Timeout per request
-            "-rate", "100"  # Requests per second
+            "-t", "50",   
+            "-timeout", "10",   
+            "-rate", "100"   
         ]
         
         print(f"[+] Running ffuf scan for {subdomain}")
         
-        # Run ffuf command
         process = subprocess.run(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=300  # 5 minute timeout for entire scan
+            timeout=300 
         )
         
-        # Check if ffuf completed successfully
+       
         if process.returncode != 0:
             print(f"[-] ffuf failed for {subdomain}: {process.stderr}")
             return results
         
-        # Wait a moment for file to be written
+      
         time.sleep(1)
         
-        # Read results with robust error handling
         results_raw = read_json(temp_file)
         if results_raw is None:
             print(f"[-] Failed to read ffuf results for {subdomain}")
             return results
         
-        # Parse results - only report 2xx and 3xx status codes
+ 
         for result in results_raw.get("results", []):
             status_code = result.get("status")
             endpoint_url = result.get("url", "")
             
-            # Only include 2xx and 3xx status codes
             if 200 <= status_code < 400:
-                # Extract just the endpoint path from the full URL
                 endpoint = endpoint_url.replace(url, "").strip("/")
-                if endpoint:  # Only add non-empty endpoints
+                if endpoint: 
                     results[endpoint] = status_code
         
         return results
@@ -135,7 +152,6 @@ def check_endpoints(subdomain):
         print(f"[-] Unexpected error scanning {subdomain}: {e}")
         return results
     finally:
-        # Clean up temporary file
         try:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
@@ -171,11 +187,9 @@ def main(subdomains):
             print(f"[bold red][-] Error processing {subdomain}: {e}[/bold red]")
             continue
     
-    # Print summary
     total_endpoints = sum(len(endpoints) for endpoints in output_dict.values())
     print(f"\n[bold green][+] Scan completed! Found {total_endpoints} total endpoints across {len(output_dict)} domains[/bold green]")
     
-    # Print detailed results
     for subdomain, endpoints in output_dict.items():
         print(f"\n[bold blue]Results for {subdomain}:[/bold blue]")
         for endpoint, status_code in endpoints.items():
